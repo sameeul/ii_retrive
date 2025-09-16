@@ -1,8 +1,10 @@
+from slugify import slugify
 import requests
 import pandas as pd
 from bs4 import BeautifulSoup
 import sqlite3
 from datetime import datetime
+import os
 
 # ----------------------------
 # CONFIG — change these
@@ -70,10 +72,9 @@ class DatabaseManager:
         
     def create_tables(self):
         cursor = self.conn.cursor()
-        
-        # Create AUTHOR table
+        # Create Authors table
         cursor.execute('''
-            CREATE TABLE IF NOT EXISTS AUTHOR (
+            CREATE TABLE IF NOT EXISTS Authors (
                 id INTEGER PRIMARY KEY,
                 name TEXT,
                 email TEXT,
@@ -82,27 +83,27 @@ class DatabaseManager:
                 slug TEXT UNIQUE
             )
         ''')
-        
-        # Create CONTENT table
+
+        # Create Contents table
         cursor.execute('''
-            CREATE TABLE IF NOT EXISTS CONTENT (
+            CREATE TABLE IF NOT EXISTS Contents (
                 id INTEGER PRIMARY KEY,
                 content TEXT
             )
         ''')
-        
-        # Create USER table (simplified for WordPress context)
+
+        # Create Users table (simplified for WordPress context)
         cursor.execute('''
-            CREATE TABLE IF NOT EXISTS USER (
+            CREATE TABLE IF NOT EXISTS Users (
                 id INTEGER PRIMARY KEY,
                 email TEXT,
                 name TEXT
             )
         ''')
-        
-        # Create ARTICLE table
+
+        # Create Articles table
         cursor.execute('''
-            CREATE TABLE IF NOT EXISTS ARTICLE (
+            CREATE TABLE IF NOT EXISTS Articles (
                 id INTEGER PRIMARY KEY,
                 title TEXT,
                 subTitle TEXT,
@@ -120,38 +121,38 @@ class DatabaseManager:
                 created_date TEXT,
                 modified_date TEXT,
                 wp_link TEXT,
-                FOREIGN KEY (authorId) REFERENCES AUTHOR(id),
-                FOREIGN KEY (contentId) REFERENCES CONTENT(id),
-                FOREIGN KEY (createdById) REFERENCES USER(id),
-                FOREIGN KEY (updatedById) REFERENCES USER(id)
+                FOREIGN KEY (authorId) REFERENCES Authors(id),
+                FOREIGN KEY (contentId) REFERENCES Contents(id),
+                FOREIGN KEY (createdById) REFERENCES Users(id),
+                FOREIGN KEY (updatedById) REFERENCES Users(id)
             )
         ''')
-        
-        # Create TAG table
+
+        # Create Tags table
         cursor.execute('''
-            CREATE TABLE IF NOT EXISTS TAG (
-                id INTEGER PRIMARY KEY,
-                tag TEXT UNIQUE
+            CREATE TABLE IF NOT EXISTS Tags (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tag TEXT UNIQUE NOT NULL,
+                slug TEXT UNIQUE NOT NULL
             )
         ''')
-        
-        # Create ARTICLE_TAG junction table
+
+        # Create ArticleTags junction table
         cursor.execute('''
-            CREATE TABLE IF NOT EXISTS ARTICLE_TAG (
+            CREATE TABLE IF NOT EXISTS ArticleTags (
                 articleId INTEGER,
                 tagId INTEGER,
                 PRIMARY KEY (articleId, tagId),
-                FOREIGN KEY (articleId) REFERENCES ARTICLE(id),
-                FOREIGN KEY (tagId) REFERENCES TAG(id)
+                FOREIGN KEY (articleId) REFERENCES Articles(id),
+                FOREIGN KEY (tagId) REFERENCES Tags(id)
             )
         ''')
-        
         self.conn.commit()
     
     def insert_author(self, author_data):
         cursor = self.conn.cursor()
         cursor.execute('''
-            INSERT OR IGNORE INTO AUTHOR (id, name, email, image, bio, slug)
+            INSERT OR IGNORE INTO Authors (id, name, email, image, bio, slug)
             VALUES (?, ?, ?, ?, ?, ?)
         ''', (
             author_data["id"],
@@ -166,23 +167,23 @@ class DatabaseManager:
     
     def insert_content(self, content_text):
         cursor = self.conn.cursor()
-        cursor.execute('INSERT INTO CONTENT (content) VALUES (?)', (content_text,))
+        cursor.execute('INSERT INTO Contents (content) VALUES (?)', (content_text,))
         self.conn.commit()
         return cursor.lastrowid
     
     def insert_user(self, user_id, name):
         cursor = self.conn.cursor()
         cursor.execute('''
-            INSERT OR IGNORE INTO USER (id, name, email)
+            INSERT OR IGNORE INTO Users (id, name, email)
             VALUES (?, ?, ?)
         ''', (user_id, name, ""))
         self.conn.commit()
         return user_id
     
-    def insert_tag(self, tag_name):
+    def insert_tag(self, tag_name, slug):
         cursor = self.conn.cursor()
-        cursor.execute('INSERT OR IGNORE INTO TAG (tag) VALUES (?)', (tag_name,))
-        cursor.execute('SELECT id FROM TAG WHERE tag = ?', (tag_name,))
+        cursor.execute('INSERT OR IGNORE INTO Tags (tag, slug) VALUES (?, ?)', (tag_name, slug))
+        cursor.execute('SELECT id FROM Tags WHERE tag = ?', (tag_name,))
         result = cursor.fetchone()
         self.conn.commit()
         return result[0] if result else None
@@ -190,7 +191,7 @@ class DatabaseManager:
     def insert_article(self, article_data):
         cursor = self.conn.cursor()
         cursor.execute('''
-            INSERT INTO ARTICLE (
+            INSERT INTO Articles (
                 id, title, subTitle, shoulder, description, authorId, contentId,
                 image, imageFolder, readCount, slug, isPublished, createdById,
                 updatedById, created_date, modified_date, wp_link
@@ -202,7 +203,7 @@ class DatabaseManager:
     def insert_article_tag(self, article_id, tag_id):
         cursor = self.conn.cursor()
         cursor.execute('''
-            INSERT OR IGNORE INTO ARTICLE_TAG (articleId, tagId)
+            INSERT OR IGNORE INTO ArticleTags (articleId, tagId)
             VALUES (?, ?)
         ''', (article_id, tag_id))
         self.conn.commit()
@@ -220,8 +221,11 @@ def process_post(post, db_manager):
     
     # Insert content
     # content_text = html_to_text(post.get("content", {}).get("rendered", ""))
-    content_text = post.get("content", {}).get("rendered", "")
-    content_id = db_manager.insert_content(content_text)
+    content_html = post.get("content", {}).get("rendered", "")
+    # Use article slug or id for unique folder name
+    unique_folder_name = post.get("slug") or str(post.get("id"))
+    processed_content_html = update_image_tags(content_html, unique_folder_name)
+    content_id = db_manager.insert_content(processed_content_html)
     
     # Insert user (using author info for simplicity, as WP doesn't expose user details easily)
     created_by_id = post.get("author")
@@ -262,8 +266,10 @@ def process_post(post, db_manager):
     
     all_tags = cat_names + tag_names
     for tag_name in all_tags:
-        if tag_name.strip():
-            tag_id = db_manager.insert_tag(tag_name.strip())
+        tag_name_clean = tag_name.strip()
+        if tag_name_clean:
+            slug = slugify(tag_name_clean)
+            tag_id = db_manager.insert_tag(tag_name_clean, slug)
             if tag_id:
                 db_manager.insert_article_tag(article_id, tag_id)
     
@@ -305,6 +311,44 @@ def fetch_all_posts():
 
     return all_posts
 
+def update_image_tags(content_html, unique_folder_name):
+    soup = BeautifulSoup(content_html, 'html.parser')
+    image_tags = soup.find_all('img')
+
+    for img_tag in image_tags:
+        src = img_tag.get('src')
+        if src:
+            # Simulate new image path (as if it was saved)
+            new_src = os.path.join(
+                "/images/articleContents",
+                unique_folder_name,
+                os.path.basename(src)
+            )
+            img_tag['src'] = new_src
+            # Set loading and decoding attributes as in the diff
+            img_tag['loading'] = 'lazy'
+            img_tag['decoding'] = 'async'
+
+        # --- Fix image alignment classes ---
+        current_class = img_tag.get('class')
+        if current_class:
+            if isinstance(current_class, str):
+                current_class = [current_class]
+
+            updated_classes = []
+            for cls in current_class:
+                if cls == "alignright":
+                    updated_classes.append("image-right")
+                elif cls == "alignleft":
+                    updated_classes.append("image-left")
+                elif cls == "aligncenter":
+                    updated_classes.append("image-center")
+                else:
+                    updated_classes.append(cls)
+            img_tag['class'] = updated_classes
+
+    return str(soup)
+
 def main():
     print("Fetching posts from WordPress API...")
     posts = fetch_all_posts()
@@ -336,7 +380,7 @@ def main():
             df.to_csv(OUT_CSV, index=False, encoding="utf-8")
             print(f"Created summary CSV: {OUT_CSV}")
     
-    print("Database structure created with tables: AUTHOR, CONTENT, ARTICLE, TAG, ARTICLE_TAG, USER")
+    print("Database structure created with tables: Authors, Contents, Articles, Tags, ArticleTags, Users")
 
 if __name__ == "__main__":
     main()
