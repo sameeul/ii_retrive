@@ -1,3 +1,68 @@
+def report_pg_notnull_columns(sqlite_db_path, pg_conn_params):
+    """
+    Compare each table in SQLite and PostgreSQL, and report columns in PostgreSQL that are NOT NULL but nullable or missing in SQLite.
+    """
+    import collections
+    sqlite_conn = sqlite3.connect(sqlite_db_path)
+    sqlite_cur = sqlite_conn.cursor()
+
+    pg_conn = psycopg2.connect(**pg_conn_params)
+    pg_cur = pg_conn.cursor()
+
+    tables = ["Authors", "Contents", "Users", "Articles", "Tags", "ArticleTags"]
+    print("\n--- PostgreSQL NOT NULL columns report ---")
+    for table in tables:
+        print(f"\nTable: {table}")
+        # Get SQLite columns
+        sqlite_cur.execute(f'PRAGMA table_info({table})')
+        sqlite_cols = {row[1]: row for row in sqlite_cur.fetchall()}  # row[1]=name, row[3]=notnull
+        # Get PostgreSQL columns
+        pg_cur.execute(f'''
+            SELECT column_name, is_nullable
+            FROM information_schema.columns
+            WHERE table_name = '{table.lower()}'
+            ORDER BY ordinal_position
+        ''')
+        pg_cols = collections.OrderedDict((row[0], row[1]) for row in pg_cur.fetchall())
+        # Report NOT NULL columns in PostgreSQL
+        found = False
+        for col, nullable in pg_cols.items():
+            if nullable == 'NO':
+                sqlite_notnull = sqlite_cols.get(col, (None, None, None, 0))[3]  # 1 if notnull in sqlite
+                if not sqlite_notnull:
+                    print(f"  - {col} is NOT NULL in PostgreSQL but nullable in SQLite or missing in SQLite")
+                    found = True
+        if not found:
+            print("  All NOT NULL columns in PostgreSQL are also NOT NULL in SQLite.")
+    sqlite_cur.close()
+    sqlite_conn.close()
+    pg_cur.close()
+    pg_conn.close()
+    print("\n--- End of report ---\n")
+def clear_postgres_tables(pg_cur, pg_conn):
+    """
+    Delete all records from the relevant tables in the correct order to avoid FK issues.
+    """
+    tables = [
+        "ArticleTags",
+        "Articles",
+        "Tags",
+        "Authors",
+        "Contents",
+        "Users"
+    ]
+    for table in tables:
+        try:
+            pg_cur.execute(f'DELETE FROM "{table}";')
+            pg_conn.commit()
+            print(f"Cleared table {table}")
+        except Exception as e:
+            print(f"Error clearing table {table}: {e}")
+            pg_conn.rollback()
+
+import psycopg2
+from psycopg2.extras import execute_values
+
 from slugify import slugify
 import requests
 import pandas as pd
@@ -19,6 +84,10 @@ OUT_SQLITE = "dump.sqlite"        # e.g. "wordpress_posts.sqlite" or None to ski
 # ----------------------------
 
 API = f"{BASE_URL}/wp-json/wp/v2/posts"
+
+BASE_IMAGE_DIR = os.getenv('BASE_IMAGE_DIR', 'images')
+ARTICLE_IMAGE_DIR = os.path.join(BASE_IMAGE_DIR, 'articles')
+CONTENT_IMAGE_DIR = os.path.join(BASE_IMAGE_DIR, 'articleContents')
 
 session = requests.Session()
 if USERNAME and APP_PASSWORD:
@@ -80,7 +149,9 @@ class DatabaseManager:
                 email TEXT,
                 image TEXT,
                 bio TEXT,
-                slug TEXT UNIQUE
+                slug TEXT UNIQUE,
+                created_date TEXT,
+                modified_date TEXT
             )
         ''')
 
@@ -97,7 +168,9 @@ class DatabaseManager:
             CREATE TABLE IF NOT EXISTS Users (
                 id INTEGER PRIMARY KEY,
                 email TEXT,
-                name TEXT
+                name TEXT,
+                created_date TEXT,
+                modified_date TEXT
             )
         ''')
 
@@ -152,15 +225,17 @@ class DatabaseManager:
     def insert_author(self, author_data):
         cursor = self.conn.cursor()
         cursor.execute('''
-            INSERT OR IGNORE INTO Authors (id, name, email, image, bio, slug)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT OR IGNORE INTO Authors (id, name, email, image, bio, slug, created_date, modified_date)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             author_data["id"],
             author_data["name"],
             author_data["author_email"],
             author_data["avatar_url"],
             author_data["description"],
-            author_data["slug"]
+            author_data["slug"],
+            datetime.now().isoformat(),
+            datetime.now().isoformat()
         ))
         self.conn.commit()
         return author_data["id"]
@@ -174,9 +249,9 @@ class DatabaseManager:
     def insert_user(self, user_id, name):
         cursor = self.conn.cursor()
         cursor.execute('''
-            INSERT OR IGNORE INTO Users (id, name, email)
-            VALUES (?, ?, ?)
-        ''', (user_id, name, ""))
+            INSERT OR IGNORE INTO Users (id, name, email, created_date, modified_date)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (user_id, name, "", datetime.now().isoformat(), datetime.now().isoformat()))
         self.conn.commit()
         return user_id
     
@@ -194,8 +269,8 @@ class DatabaseManager:
             INSERT INTO Articles (
                 id, title, subTitle, shoulder, description, authorId, contentId,
                 image, imageFolder, readCount, slug, isPublished, createdById,
-                updatedById, created_date, modified_date, wp_link
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                updatedById, created_date, modified_date
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', article_data)
         self.conn.commit()
         return article_data[0]  # return article id
@@ -226,7 +301,7 @@ def process_post(post, db_manager):
     unique_folder_name = post.get("slug") or str(post.get("id"))
     processed_content_html = update_image_tags(content_html, unique_folder_name)
     content_id = db_manager.insert_content(processed_content_html)
-    
+    print(f"Inserted content for post ID {post.get('id')} with content ID {content_id}")
     # Insert user (using author info for simplicity, as WP doesn't expose user details easily)
     created_by_id = post.get("author")
     if created_by_id and author_info:
@@ -236,7 +311,10 @@ def process_post(post, db_manager):
     title = post.get("title", {}).get("rendered", "")
     excerpt = html_to_text(post.get("excerpt", {}).get("rendered", ""))
     featured_image = featured_media_url(post)
-    
+    if featured_image:
+        featured_image_base = os.path.basename(featured_image)
+        featured_image = os.path.join(ARTICLE_IMAGE_DIR, featured_image_base)
+
     article_data = (
         post.get("id"),                    # id
         title,                             # title
@@ -254,7 +332,6 @@ def process_post(post, db_manager):
         created_by_id,                     # updatedById (same as created)
         post.get("date"),                  # created_date
         post.get("modified"),              # modified_date
-        post.get("link")                   # wp_link
     )
     
     # Insert article
@@ -320,7 +397,7 @@ def update_image_tags(content_html, unique_folder_name):
         if src:
             # Simulate new image path (as if it was saved)
             new_src = os.path.join(
-                "/images/articleContents",
+                CONTENT_IMAGE_DIR,
                 unique_folder_name,
                 os.path.basename(src)
             )
@@ -349,7 +426,7 @@ def update_image_tags(content_html, unique_folder_name):
 
     return str(soup)
 
-def main():
+def retrieve_from_wordpress():
     print("Fetching posts from WordPress API...")
     posts = fetch_all_posts()
     print(f"Found {len(posts)} posts")
@@ -381,6 +458,260 @@ def main():
             print(f"Created summary CSV: {OUT_CSV}")
     
     print("Database structure created with tables: Authors, Contents, Articles, Tags, ArticleTags, Users")
+
+
+def copy_sqlite_to_postgres(sqlite_db_path, pg_conn_params):
+    """
+    Copy all data from the SQLite database to a PostgreSQL database.
+    pg_conn_params: dict with keys dbname, user, password, host, port
+    """
+    sqlite_conn = sqlite3.connect(sqlite_db_path)
+    sqlite_cur = sqlite_conn.cursor()
+
+    # Connect to PostgreSQL and sanity check
+    pg_conn = psycopg2.connect(**pg_conn_params)
+    pg_cur = pg_conn.cursor()
+    try:
+        pg_cur.execute("SELECT version();")
+        version = pg_cur.fetchone()[0]
+        print(f"Connected to PostgreSQL: {version}")
+
+        # List all tables in the public schema
+        print("\nTables in public schema:")
+        pg_cur.execute("""
+            SELECT table_name FROM information_schema.tables
+            WHERE table_schema = 'public'
+            ORDER BY table_name;
+        """)
+        tables = pg_cur.fetchall()
+        for t in tables:
+            table_name = t[0]
+            print(f"  {table_name}")
+            # Print columns for each table
+            try:
+                pg_cur.execute(f"SELECT column_name, data_type FROM information_schema.columns WHERE table_name = '{table_name}';")
+                columns = pg_cur.fetchall()
+                for col, dtype in columns:
+                    print(f"    - {col}: {dtype}")
+            except Exception as e:
+                print(f"    Could not fetch columns for {table_name}: {e}")
+
+        # Print table schemas for expected tables
+        print("\nPostgreSQL table schemas (expected tables):")
+        for table in ["Authors", "Contents", "Articles", "Tags", "ArticleTags"]:
+            try:
+                pg_cur.execute(f"SELECT column_name, data_type FROM information_schema.columns WHERE table_name = '{table.lower()}';")
+                columns = pg_cur.fetchall()
+                print(f"Table {table}:")
+                for col, dtype in columns:
+                    print(f"  {col}: {dtype}")
+            except Exception as e:
+                print(f"  Could not fetch schema for {table}: {e}")
+
+        # Clear all records from the tables before insertion
+        print("\nClearing all records from relevant tables...")
+        # clear_postgres_tables(pg_cur, pg_conn)
+
+        # --- INSERT DATA ---
+        print("\nCopying data from SQLite to PostgreSQL...")
+        table_order = [
+            # "Authors",
+            # "Contents",
+            "Users",
+            "Articles",
+            # "Tags",
+            "ArticleTags"
+        ]
+        for table in table_order:
+            print(f"Copying table {table}...")
+            try:
+                copy_table_with_column_mapping(sqlite_cur, pg_cur, pg_conn, table, SQLITE_TO_PG_COL_MAP[table])
+                print(f"  Done copying {table}")
+            except Exception as e:
+                print(f"Error copying table {table}: {e}")
+
+    except Exception as e:
+        print(f"PostgreSQL sanity check failed: {e}")
+    finally:
+        sqlite_cur.close()
+        sqlite_conn.close()
+        pg_cur.close()
+        pg_conn.close()
+SQLITE_TO_PG_COL_MAP = {
+    "Authors": {
+        "id": "id",
+        "name": "name",
+        "email": "email",
+        "image": "image",
+        "bio": "bio",
+        "slug": "slug",
+        "created_date": "createdAt",
+        "modified_date": "updatedAt"
+    },
+    "Contents": {
+        "id": "id",
+        "content": "content"
+    },
+    "Users": {
+        "id": "id",
+        "email": "email",
+        "name": "name",
+        "created_date": "createdAt",
+        "modified_date": "updatedAt",
+    },
+    "Articles": {
+        "id": "id",
+        "title": "title",
+        "subTitle": "subTitle",         # Case-sensitive!
+        "shoulder": "shoulder",
+        "description": "description",
+        "authorId": "authorId",
+        "contentId": "contentId",
+        "image": "image",
+        "imageFolder": "imageFolder",
+        "readCount": "readCount",
+        "slug": "slug",
+        "isPublished": "isPublished",
+        "createdById": "createdById",
+        "updatedById": "updatedById",
+        "created_date": "createdAt",
+        "modified_date": "updatedAt",
+    },
+    "Tags": {
+        "id": "id",
+        "tag": "tag",
+        "slug": "slug"
+    },
+    "ArticleTags": {
+        "articleId": "ArticleId",
+        "tagId": "TagId"
+    }
+}
+
+def copy_table_with_column_mapping(sqlite_cur, pg_cur, pg_conn, table, col_map):
+    sqlite_cur.execute(f"SELECT * FROM {table}")
+    rows = sqlite_cur.fetchall()
+    sqlite_columns = [desc[0] for desc in sqlite_cur.description]
+
+    # Map columns for PostgreSQL
+    pg_columns = [col_map[col] for col in sqlite_columns if col in col_map]
+    pg_columns_sql = ', '.join(f'"{col}"' for col in pg_columns)
+    placeholders = ', '.join(['%s'] * len(pg_columns))
+
+    for row in rows:
+        mapped_row = [row[sqlite_columns.index(sql_col)] for sql_col in sqlite_columns if sql_col in col_map]
+        # Convert isPublished to boolean if present in Articles
+        if table == "Articles" and "isPublished" in pg_columns:
+            idx = pg_columns.index("isPublished")
+            mapped_row[idx] = bool(mapped_row[idx]) if mapped_row[idx] is not None else False
+        try:
+            pg_cur.execute(
+                f'INSERT INTO "{table}" ({pg_columns_sql}) VALUES ({placeholders})',
+                mapped_row
+            )
+        except Exception as e:
+            print(f"Error inserting row into {table}: {e}")
+            pg_conn.rollback()
+        else:
+            pg_conn.commit()
+
+def compare_column_types(sqlite_db_path, pg_conn_params):
+    """
+    Compare column data types between SQLite and PostgreSQL for each table.
+    Reports columns with mismatched or missing types.
+    """
+    import collections
+    sqlite_conn = sqlite3.connect(sqlite_db_path)
+    sqlite_cur = sqlite_conn.cursor()
+
+    pg_conn = psycopg2.connect(**pg_conn_params)
+    pg_cur = pg_conn.cursor()
+
+    tables = ["Authors", "Contents", "Users", "Articles", "Tags", "ArticleTags"]
+    print("\n--- Column Type Comparison Report ---")
+    for table in tables:
+        print(f"\nTable: {table}")
+
+        # Get SQLite columns and types
+        sqlite_cur.execute(f'PRAGMA table_info({table})')
+        sqlite_cols = {row[1]: row[2].upper() for row in sqlite_cur.fetchall()}  # row[1]=name, row[2]=type
+
+        # Get PostgreSQL columns and types
+        pg_cur.execute(f'''
+            SELECT column_name, data_type
+            FROM information_schema.columns
+            WHERE table_name = '{table.lower()}'
+            ORDER BY ordinal_position
+        ''')
+        pg_cols = collections.OrderedDict((row[0], row[1].upper()) for row in pg_cur.fetchall())
+
+        # Compare types
+        for col, pg_type in pg_cols.items():
+            sqlite_type = sqlite_cols.get(col)
+            if sqlite_type is None:
+                print(f"  - {col}: present in PostgreSQL ({pg_type}), missing in SQLite")
+            elif sqlite_type != pg_type:
+                print(f"  - {col}: type mismatch (SQLite: {sqlite_type}, PostgreSQL: {pg_type})")
+        for col, sqlite_type in sqlite_cols.items():
+            if col not in pg_cols:
+                print(f"  - {col}: present in SQLite ({sqlite_type}), missing in PostgreSQL")
+        if not pg_cols:
+            print("  (No columns found in PostgreSQL for this table)")
+    sqlite_cur.close()
+    sqlite_conn.close()
+    pg_cur.close()
+    pg_conn.close()
+    print("\n--- End of type comparison report ---\n")
+
+    
+def main():
+    # take two option one to retrieve from wordpress and create sqlite db
+    # second to copy from sqlite to postgres
+    import argparse 
+    parser = argparse.ArgumentParser(description="WordPress to SQLite/PostgreSQL migration tool")
+    parser.add_argument('--retrieve', action='store_true', help="Retrieve posts from WordPress and create SQLite database")
+    parser.add_argument('--copy', action='store_true', help="Copy data from SQLite to PostgreSQL")
+    parser.add_argument('--report-notnull', action='store_true', help="Report NOT NULL columns in PostgreSQL that are nullable or missing in SQLite")
+    parser.add_argument('--diff', action='store_true', help="Compare column data types between SQLite and PostgreSQL")
+
+    args = parser.parse_args()
+
+    if args.retrieve:
+        retrieve_from_wordpress()
+    elif args.copy:
+        # Define your SQLite and PostgreSQL connection parameters
+        sqlite_db_path = "dump.sqlite"
+        pg_conn_params = {
+            "dbname": "railway",
+            "user": "postgres",
+            "password": "FePMWGCGONpzSaWpXOqcstDodnKujLLy",
+            "host": "turntable.proxy.rlwy.net",
+            "port": "12414"
+        }
+        # Call the function to copy data
+        copy_sqlite_to_postgres(sqlite_db_path, pg_conn_params)
+    elif args.report_notnull:
+        # Define your SQLite and PostgreSQL connection parameters
+        sqlite_db_path = "dump.sqlite"
+        pg_conn_params = {
+            "dbname": "railway",
+            "user": "postgres",
+            "password": "FePMWGCGONpzSaWpXOqcstDodnKujLLy",
+            "host": "turntable.proxy.rlwy.net",
+            "port": "12414"
+        }
+        report_pg_notnull_columns(sqlite_db_path, pg_conn_params)
+    elif args.diff:
+        # Define your SQLite and PostgreSQL connection parameters
+        sqlite_db_path = "dump.sqlite"
+        pg_conn_params = {
+            "dbname": "railway",
+            "user": "postgres",
+            "password": "FePMWGCGONpzSaWpXOqcstDodnKujLLy",
+            "host": "turntable.proxy.rlwy.net",
+            "port": "12414"
+        }
+        compare_column_types(sqlite_db_path, pg_conn_params)
 
 if __name__ == "__main__":
     main()
