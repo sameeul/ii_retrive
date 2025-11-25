@@ -17,7 +17,7 @@ import html
 SQLITE_DB_PATH = 'dump.sqlite'
 
 # Replace with your PostgreSQL connection details
-POSTGRES_DB_NAME = 'IndustryInsider1'
+POSTGRES_DB_NAME = 'IndustryInsider2'
 POSTGRES_USER = 'postgres'
 POSTGRES_PASSWORD = 'MinhajPostgres'
 POSTGRES_HOST = 'localhost'
@@ -27,7 +27,7 @@ default_email = "default@email.com"
 
 # --- File System Configuration ---
 # Base directory for all downloaded article images
-BASE_IMAGE_DIR = '../../Backend/images'
+BASE_IMAGE_DIR = './images'
 ARTICLE_IMAGE_DIR = os.path.join(BASE_IMAGE_DIR, 'articles')
 CONTENT_IMAGE_DIR = os.path.join(BASE_IMAGE_DIR, 'articleContents')
 
@@ -65,52 +65,73 @@ def create_directories():
 
 def download_and_save_image(url, destination_folder, filename=None, convert_to_webp=False):
     """
-    Downloads an image from a URL and saves it to a specified folder.
-    Optionally converts the image to WEBP format.
+    Downloads an image from a URL and saves it.
+    If convert_to_webp=True → saves as .webp
+    Returns final absolute file path or None.
     """
-    if not url or not url.startswith(('http://', 'https://')):
-        print(f"Skipping invalid URL: {url}")
+    if not url or not url.startswith(("http://", "https://")):
+        print(f"❌ Invalid URL: {url}")
         return None
 
     try:
-        response = requests.get(url, stream=True)
+        response = requests.get(url, stream=True, timeout=15)
         response.raise_for_status()
-
-        if not filename:
-            # Use the last part of the URL as filename, with sanitization
-            filename = os.path.basename(urlparse(url).path)
-            # Remove query parameters and ensure valid filename
-            filename = re.sub(r'[^a-zA-Z0-9_.-]', '', filename)
-            if not filename:
-                filename = "default_image.jpg"
-
-        full_path = os.path.join(destination_folder, filename)
-
-        if convert_to_webp:
-            # Use Pillow to open and save as WEBP
-            temp_path = full_path + '.temp'
-            with open(temp_path, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    f.write(chunk)
-            
-            img = Image.open(temp_path).convert("RGB")
-            webp_path = os.path.join(destination_folder, os.path.splitext(filename)[0] + '.webp')
-            img.save(webp_path, 'webp')
-            os.remove(temp_path)
-            print(f"Downloaded and converted image to: {webp_path}")
-            return webp_path
-        else:
-            # Save the image as is
-            with open(full_path, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    f.write(chunk)
-            print(f"Downloaded image to: {full_path}")
-            return full_path
-    except requests.exceptions.RequestException as e:
-        print(f"Error downloading image from {url}: {e}")
-        return None
+        image_bytes = response.content
     except Exception as e:
-        print(f"An error occurred while processing image {url}: {e}")
+        print(f"❌ Failed to download: {url} → {e}")
+        return None
+
+    # ----------------------------
+    # Filename handling
+    # ----------------------------
+    if not filename:
+        filename = os.path.basename(urlparse(url).path)
+        filename = re.sub(r"[^a-zA-Z0-9_.-]", "", filename)
+        if not filename:
+            filename = "image.jpg"
+
+    os.makedirs(destination_folder, exist_ok=True)
+
+    # ----------------------------
+    # Convert to WebP if needed
+    # ----------------------------
+    if convert_to_webp:
+        temp_path = os.path.join(destination_folder, filename + ".tmp")
+
+        try:
+            with open(temp_path, "wb") as f:
+                f.write(image_bytes)
+
+            img = Image.open(temp_path).convert("RGB")
+            webp_filename = os.path.splitext(filename)[0] + ".webp"
+            webp_path = os.path.join(destination_folder, webp_filename)
+
+            img.save(webp_path, "webp", quality=85)
+            os.remove(temp_path)
+
+            print(f"✅ Converted to WEBP: {webp_path}")
+            return webp_path
+
+        except Exception as e:
+            print(f"❌ WEBP conversion failed for {url}: {e}")
+            traceback.print_exc()
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+            return None
+
+    # ----------------------------
+    # Save as original (no conversion)
+    # ----------------------------
+    try:
+        full_path = os.path.join(destination_folder, filename)
+        with open(full_path, "wb") as f:
+            f.write(image_bytes)
+
+        print(f"✅ Image saved: {full_path}")
+        return full_path
+
+    except Exception as e:
+        print(f"❌ Failed to save image {filename}: {e}")
         return None
 
 def migrate_tags(sqlite_cur, postgres_cur, postgres_conn):
@@ -175,132 +196,157 @@ def migrate_authors(sqlite_cur, postgres_cur, postgres_conn, default_email="defa
 
 
 def migrate_articles_and_content(sqlite_cur, postgres_cur, postgres_conn):
-    """
-    Migrates articles and content, handling image downloads and content modification.
-    """
     print("\n--- Migrating Articles & Content ---")
+
     try:
-        sqlite_cur.execute(
-            'SELECT Article.id, Article.title, Article.slug, Article.image, Article."subTitle", Article.description, '
-            'Article."authorId", Article."createdAt", Article."updatedAt", Content.id, Content.Content '
-            'FROM Article JOIN Content ON Article."contentId" = Content.id'
-        )
+        sqlite_cur.execute("""
+            SELECT Article.id, Article.title, Article.slug, Article.image,
+                   Article."subTitle", Article.description, Article."authorId",
+                   Article."createdAt", Article."updatedAt",
+                   Content.id, Content.Content
+            FROM Article
+            JOIN Content ON Article."contentId" = Content.id
+        """)
         articles_data = sqlite_cur.fetchall()
-    except Exception as e:
-        print("❌ SQLite query failed while fetching articles & content:")
+
+    except Exception:
+        print("❌ SQLite fetch error")
         traceback.print_exc()
         return
 
-    for (id, title, slug, image_url, subTitle, description, author_id, created_at, updated_at, content_id, content_html) in articles_data:
-        print(f"\n📝 Processing article: '{title}' (ID: {id})")
+    # --------------------------------------------------------------------
+    # MAIN LOOP — process all articles
+    # --------------------------------------------------------------------
+    for (id, title, slug, image_url, subTitle, description,
+         author_id, created_at, updated_at, content_id, content_html) in articles_data:
+
+        print(f"\n📝 Processing: {title} (ID {id})")
 
         try:
-            # Ensure IDs are integers
-            article_id = int(id)
-            author_id = int(author_id)
-            content_id = int(content_id)
+            folder_name = slug if slug else str(id)
+            article_content_folder = os.path.join(CONTENT_IMAGE_DIR, folder_name)
+            os.makedirs(article_content_folder, exist_ok=True)
 
-            # --- Create a unique folder for this article's content images ---
-            unique_folder_name = slug if slug else str(article_id)
-            article_content_image_folder = os.path.join(CONTENT_IMAGE_DIR, unique_folder_name)
-            os.makedirs(article_content_image_folder, exist_ok=True)
-
-            # --- Handle Article Image ---
+            # --------------------------------------------------------
+            # ARTICLE FEATURE IMAGE
+            # --------------------------------------------------------
             new_image_path = None
             if image_url:
                 filename = os.path.basename(urlparse(image_url).path)
-                new_image_full_path = download_and_save_image(
-                    image_url, ARTICLE_IMAGE_DIR,
+                saved_path = download_and_save_image(
+                    image_url,
+                    ARTICLE_IMAGE_DIR,
                     filename=filename,
                     convert_to_webp=False
                 )
-                if new_image_full_path:
-                    new_image_path = os.path.join("articles", os.path.basename(new_image_full_path))
 
-            # --- Handle Content Images & Classes ---
-            soup = BeautifulSoup(content_html, 'html.parser')
-            image_tags = soup.find_all('img')
+                if saved_path:
+                    new_image_path = os.path.join("articles", os.path.basename(saved_path))
 
-            for img_tag in image_tags:
-                src = img_tag.get('src')
-                if src:
-                    new_content_image_full_path = download_and_save_image(
-                        src,
-                        article_content_image_folder,
-                        convert_to_webp=True
-                    )
-                    if new_content_image_full_path:
-                        new_src = os.path.join(
-                            "/images/articleContents",
-                            unique_folder_name,
-                            os.path.basename(new_content_image_full_path)
-                        )
-                        img_tag['src'] = new_src
+            # --------------------------------------------------------
+            # CONTENT HTML REWRITE
+            # --------------------------------------------------------
+            soup = BeautifulSoup(content_html or "", "html.parser")
 
-                # --- Fix image alignment classes ---
-                current_class = img_tag.get('class')
-                if current_class:
-                    if isinstance(current_class, str):
-                        current_class = [current_class]
+            for img_tag in soup.find_all("img"):
+                src = img_tag.get("src")
+                if not src:
+                    continue
 
-                    updated_classes = []
-                    for cls in current_class:
-                        if cls == "alignright":
-                            updated_classes.append("image-right")
-                        elif cls == "alignleft":
-                            updated_classes.append("image-left")
-                        elif cls == "aligncenter":
-                            updated_classes.append("image-center")
-                        else:
-                            updated_classes.append(cls)  # keep other classes
-                    img_tag['class'] = updated_classes
+                saved_path = download_and_save_image(
+                    src,
+                    article_content_folder,
+                    convert_to_webp=True
+                )
+
+                if saved_path:
+                    new_src = f"articleContents/{folder_name}/{os.path.basename(saved_path)}"
+                    img_tag["src"] = new_src
+
+                # Fix image alignment classes
+                classes = img_tag.get("class", [])
+                fixed_classes = []
+
+                for cls in classes:
+                    if cls == "alignright": fixed_classes.append("image-right")
+                    elif cls == "alignleft": fixed_classes.append("image-left")
+                    elif cls == "aligncenter": fixed_classes.append("image-center")
+                    else: fixed_classes.append(cls)
+
+                img_tag["class"] = fixed_classes
 
             modified_content_html = str(soup)
 
-            # --- Insert into Content table ---
+            # --------------------------------------------------------
+            # INSERT INTO CONTENT TABLE
+            # --------------------------------------------------------
             try:
-                postgres_cur.execute(
-                    'INSERT INTO "Contents" (id, content) VALUES (%s, %s) ON CONFLICT (id) DO NOTHING',
-                    (content_id, modified_content_html)
-                )
-                print(f"✅ Added content for article '{title}'.")
-            except Exception as e:
-                print(f"\n❌ Error adding content for article '{title}' (ID={article_id}): {e}")
+                postgres_cur.execute("""
+                    INSERT INTO "Contents" (id, content)
+                    VALUES (%s, %s)
+                    ON CONFLICT (id) DO UPDATE SET content = EXCLUDED.content
+                """, (content_id, modified_content_html))
+
+            except Exception:
+                print(f"❌ Content insert failed for article {id}")
                 traceback.print_exc()
                 postgres_conn.rollback()
-                continue  # skip this article
+                continue
 
-            # --- Insert into Article table ---
+            # --------------------------------------------------------
+            # INSERT INTO ARTICLES TABLE
+            # --------------------------------------------------------
             try:
-                decoded_title = html.unescape(title)
-                postgres_cur.execute(
-                    'INSERT INTO "Articles" '
-                    '(id, title, slug, description, image, "authorId", "contentId", "imageFolder", "isPublished", '
-                    '"createdById", "updatedById", "createdAt", "updatedAt", "subTitle") '
-                    'VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) '
-                    'ON CONFLICT (id) DO NOTHING',
-                    (article_id, decoded_title, slug, description, new_image_path, author_id, content_id,
-                     unique_folder_name, True, 1, 1, created_at, updated_at, subTitle)
-                )
-                print(f"✅ Added article: {title}")
-            except Exception as e:
-                print(f"\n❌ Error adding article '{title}' (ID={article_id}): {e}")
+                postgres_cur.execute("""
+                    INSERT INTO "Articles"
+                    (id, title, slug, description, image, "authorId",
+                     "contentId", "imageFolder", "isPublished",
+                     "createdById", "updatedById",
+                     "createdAt", "updatedAt", "subTitle")
+                    VALUES
+                    (%s, %s, %s, %s, %s, %s, %s, %s, TRUE,
+                     1, 1, %s, %s, %s)
+                    ON CONFLICT (id)
+                    DO UPDATE SET
+                        title = EXCLUDED.title,
+                        description = EXCLUDED.description,
+                        image = EXCLUDED.image,
+                        "updatedAt" = EXCLUDED."updatedAt"
+                """, (
+                    id,
+                    html.unescape(title),
+                    slug,
+                    description,
+                    new_image_path,
+                    author_id,
+                    content_id,
+                    folder_name,
+                    created_at,
+                    updated_at,
+                    subTitle
+                ))
+
+            except Exception:
+                print(f"❌ Article insert failed for ID {id}")
                 traceback.print_exc()
                 postgres_conn.rollback()
 
-        except Exception as e:
-            print(f"\n⚠️ Unexpected error while processing article '{title}' (ID={id}): {e}")
+        except Exception:
+            print(f"⚠️ Unexpected error on article {id}")
             traceback.print_exc()
             postgres_conn.rollback()
 
+    # --------------------------------------------------------
+    # FINAL COMMIT
+    # --------------------------------------------------------
     try:
         postgres_conn.commit()
-        print("\n🎉 Article & Content migration complete.")
-    except Exception as e:
-        print("\n❌ Commit failed for articles & content.")
+        print("\n🎉 Migration completed successfully!")
+
+    except Exception:
+        print("❌ Commit failed!")
         traceback.print_exc()
         postgres_conn.rollback()
-
 
 def migrate_articletags(sqlite_cur, postgres_cur, postgres_conn):
     """Migrates the many-to-many relationship between articles and tags."""
