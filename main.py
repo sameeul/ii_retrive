@@ -85,7 +85,7 @@ OUT_SQLITE = "dump.sqlite"        # e.g. "wordpress_posts.sqlite" or None to ski
 
 API = f"{BASE_URL}/wp-json/wp/v2/posts"
 
-BASE_IMAGE_DIR = os.getenv('BASE_IMAGE_DIR', 'images')
+BASE_IMAGE_DIR = os.getenv('BASE_IMAGE_DIR', '')
 ARTICLE_IMAGE_DIR = os.path.join(BASE_IMAGE_DIR, 'articles')
 CONTENT_IMAGE_DIR = os.path.join(BASE_IMAGE_DIR, 'articleContents')
 
@@ -313,7 +313,30 @@ def process_post(post, db_manager):
     featured_image = featured_media_url(post)
     if featured_image:
         featured_image_base = os.path.basename(featured_image)
-        featured_image = os.path.join(ARTICLE_IMAGE_DIR, featured_image_base)
+        featured_image_path = os.path.join(ARTICLE_IMAGE_DIR, featured_image_base)
+        
+        # Download and save the featured image
+        try:
+            # Create directory if it doesn't exist
+            os.makedirs(os.path.dirname(featured_image_path), exist_ok=True)
+            
+            # Download the featured image
+            print(f"Downloading featured image: {featured_image}")
+            response = requests.get(featured_image, timeout=30)
+            response.raise_for_status()
+            
+            # Save the featured image
+            with open(featured_image_path, 'wb') as f:
+                f.write(response.content)
+            print(f"Saved featured image to: {featured_image_path}")
+            
+            # Use the local path for the database
+            featured_image = featured_image_path
+            
+        except Exception as e:
+            print(f"Error downloading featured image {featured_image}: {e}")
+            # Keep original URL if download fails
+            pass
 
     article_data = (
         post.get("id"),                    # id
@@ -389,22 +412,126 @@ def fetch_all_posts():
     return all_posts
 
 def update_image_tags(content_html, unique_folder_name):
+    import requests
+    import os
+    from urllib.parse import urlparse
+    
     soup = BeautifulSoup(content_html, 'html.parser')
     image_tags = soup.find_all('img')
 
     for img_tag in image_tags:
         src = img_tag.get('src')
         if src:
-            # Simulate new image path (as if it was saved)
+            # Create the new path
             new_src = os.path.join(
                 CONTENT_IMAGE_DIR,
                 unique_folder_name,
                 os.path.basename(src)
             )
+            
+            # Download and save the image
+            try:
+                # Create directory if it doesn't exist
+                os.makedirs(os.path.dirname(new_src), exist_ok=True)
+                
+                # Download the image
+                print(f"Downloading image: {src}")
+                response = requests.get(src, timeout=30)
+                response.raise_for_status()
+                
+                # Save the image
+                with open(new_src, 'wb') as f:
+                    f.write(response.content)
+                print(f"Saved image to: {new_src}")
+                
+            except Exception as e:
+                print(f"Error downloading image {src}: {e}")
+                # Keep original src if download fails
+                continue
+            
+            # Update src attribute with new path
             img_tag['src'] = new_src
-            # Set loading and decoding attributes as in the diff
+            # Set loading and decoding attributes
             img_tag['loading'] = 'lazy'
             img_tag['decoding'] = 'async'
+
+        # Update srcset attribute if it exists
+        srcset = img_tag.get('srcset')
+        if srcset:
+            # Split srcset by comma to get individual entries
+            srcset_entries = [entry.strip() for entry in srcset.split(',')]
+            updated_entries = []
+            
+            for entry in srcset_entries:
+                # Each entry is in format: "url width_descriptor" (e.g., "image.png 1553w")
+                parts = entry.strip().split()
+                if len(parts) >= 2:
+                    old_url = parts[0]
+                    width_descriptor = parts[-1]  # e.g., "1553w"
+                    
+                    # Create new path for this srcset image
+                    new_url = os.path.join(
+                        CONTENT_IMAGE_DIR,
+                        unique_folder_name,
+                        os.path.basename(old_url)
+                    )
+                    
+                    # Download and save the srcset image
+                    try:
+                        # Create directory if it doesn't exist
+                        os.makedirs(os.path.dirname(new_url), exist_ok=True)
+                        
+                        # Download the image if it doesn't already exist
+                        if not os.path.exists(new_url):
+                            print(f"Downloading srcset image: {old_url}")
+                            response = requests.get(old_url, timeout=30)
+                            response.raise_for_status()
+                            
+                            # Save the image
+                            with open(new_url, 'wb') as f:
+                                f.write(response.content)
+                            print(f"Saved srcset image to: {new_url}")
+                        
+                        # Rebuild the entry: "new_url width_descriptor"
+                        updated_entry = f"{new_url} {width_descriptor}"
+                        updated_entries.append(updated_entry)
+                        
+                    except Exception as e:
+                        print(f"Error downloading srcset image {old_url}: {e}")
+                        # Keep original URL if download fails
+                        updated_entry = f"{old_url} {width_descriptor}"
+                        updated_entries.append(updated_entry)
+                        
+                elif len(parts) == 1:
+                    # Just a URL without width descriptor
+                    old_url = parts[0]
+                    new_url = os.path.join(
+                        CONTENT_IMAGE_DIR,
+                        unique_folder_name,
+                        os.path.basename(old_url)
+                    )
+                    
+                    # Download and save the image
+                    try:
+                        os.makedirs(os.path.dirname(new_url), exist_ok=True)
+                        
+                        if not os.path.exists(new_url):
+                            print(f"Downloading image: {old_url}")
+                            response = requests.get(old_url, timeout=30)
+                            response.raise_for_status()
+                            
+                            with open(new_url, 'wb') as f:
+                                f.write(response.content)
+                            print(f"Saved image to: {new_url}")
+                        
+                        updated_entries.append(new_url)
+                        
+                    except Exception as e:
+                        print(f"Error downloading image {old_url}: {e}")
+                        updated_entries.append(old_url)
+            
+            # Rejoin the srcset entries with commas and spaces
+            img_tag['srcset'] = ', '.join(updated_entries)
 
         # --- Fix image alignment classes ---
         current_class = img_tag.get('class')
@@ -510,16 +637,16 @@ def copy_sqlite_to_postgres(sqlite_db_path, pg_conn_params):
 
         # Clear all records from the tables before insertion
         print("\nClearing all records from relevant tables...")
-        # clear_postgres_tables(pg_cur, pg_conn)
+        clear_postgres_tables(pg_cur, pg_conn)
 
         # --- INSERT DATA ---
         print("\nCopying data from SQLite to PostgreSQL...")
         table_order = [
-            # "Authors",
-            # "Contents",
+            "Authors",
+            "Contents",
             "Users",
             "Articles",
-            # "Tags",
+            "Tags",
             "ArticleTags"
         ]
         for table in table_order:
@@ -682,11 +809,11 @@ def main():
         # Define your SQLite and PostgreSQL connection parameters
         sqlite_db_path = "dump.sqlite"
         pg_conn_params = {
-            "dbname": "railway",
-            "user": "postgres",
-            "password": "FePMWGCGONpzSaWpXOqcstDodnKujLLy",
-            "host": "turntable.proxy.rlwy.net",
-            "port": "12414"
+            "dbname": "appdb",
+            "user": "appuser",
+            "password": "supersecret",
+            "host": "127.0.0.1",
+            "port": "5433"
         }
         # Call the function to copy data
         copy_sqlite_to_postgres(sqlite_db_path, pg_conn_params)
@@ -694,22 +821,22 @@ def main():
         # Define your SQLite and PostgreSQL connection parameters
         sqlite_db_path = "dump.sqlite"
         pg_conn_params = {
-            "dbname": "railway",
-            "user": "postgres",
-            "password": "FePMWGCGONpzSaWpXOqcstDodnKujLLy",
-            "host": "turntable.proxy.rlwy.net",
-            "port": "12414"
+            "dbname": "appdb",
+            "user": "appuser",
+            "password": "supersecret",
+            "host": "127.0.0.1",
+            "port": "5433"
         }
         report_pg_notnull_columns(sqlite_db_path, pg_conn_params)
     elif args.diff:
         # Define your SQLite and PostgreSQL connection parameters
         sqlite_db_path = "dump.sqlite"
         pg_conn_params = {
-            "dbname": "railway",
-            "user": "postgres",
-            "password": "FePMWGCGONpzSaWpXOqcstDodnKujLLy",
-            "host": "turntable.proxy.rlwy.net",
-            "port": "12414"
+            "dbname": "appdb",
+            "user": "appuser",
+            "password": "supersecret",
+            "host": "127.0.0.1",
+            "port": "5433"
         }
         compare_column_types(sqlite_db_path, pg_conn_params)
 
