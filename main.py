@@ -98,6 +98,45 @@ def html_to_text(html):
         return ""
     return BeautifulSoup(html, "html.parser").get_text(separator=" ", strip=True)
 
+SELECTIVE_ENTITY_REPLACEMENTS = {
+    "&#8212;": "—",
+    "&#8212": "—",
+    "&8212;": "—",
+    "&8212": "—",
+    "&#8216;": "‘",
+    "&#8216": "‘",
+    "&8216;": "‘",
+    "&8216": "‘",
+    "&#8217;": "’",
+    "&#8217": "’",
+    "&8217;": "’",
+    "&8217": "’",
+    "&#038;": "&",
+    "&#038": "&",
+    "&038;": "&",
+    "&038": "&",
+    "&#8211;": "–",
+    "&#8211": "–",
+    "&8211;": "–",
+    "&8211": "–",
+    "&#8220": "“",
+    "&#8220;": "“",
+    "&8220": "“",
+    "&8220;": "“",
+    "&#8221": "”",
+    "&#8221;": "”",
+    "&8221": "”",
+    "&8221;": "”",
+}
+
+def decode_selected_entities(text):
+    if not text:
+        return ""
+    decoded = text
+    for encoded, decoded_char in SELECTIVE_ENTITY_REPLACEMENTS.items():
+        decoded = decoded.replace(encoded, decoded_char)
+    return decoded
+
 def term_names_from_embedded(p, taxonomy):
     """
     taxonomy: 'category' or 'post_tag'
@@ -300,6 +339,7 @@ def process_post(post, db_manager):
     # Use article slug or id for unique folder name
     unique_folder_name = post.get("slug") or str(post.get("id"))
     processed_content_html = update_image_tags(content_html, unique_folder_name)
+    processed_content_html = decode_selected_entities(processed_content_html)
     content_id = db_manager.insert_content(processed_content_html)
     print(f"Inserted content for post ID {post.get('id')} with content ID {content_id}")
     # Insert user (using author info for simplicity, as WP doesn't expose user details easily)
@@ -308,8 +348,8 @@ def process_post(post, db_manager):
         db_manager.insert_user(created_by_id, author_info["name"])
     
     # Prepare article data
-    title = post.get("title", {}).get("rendered", "")
-    excerpt = html_to_text(post.get("excerpt", {}).get("rendered", ""))
+    title = decode_selected_entities(post.get("title", {}).get("rendered", ""))
+    excerpt = decode_selected_entities(html_to_text(post.get("excerpt", {}).get("rendered", "")))
     featured_image = featured_media_url(post)
     if featured_image:
         featured_image_base = os.path.basename(featured_image)
