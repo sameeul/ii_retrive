@@ -293,6 +293,22 @@ class DatabaseManager:
         ''', (user_id, name, "", datetime.now().isoformat(), datetime.now().isoformat()))
         self.conn.commit()
         return user_id
+
+    def reset_users_to_migration_user(self, email, name):
+        cursor = self.conn.cursor()
+        cursor.execute('DELETE FROM Users')
+        now = datetime.now().isoformat()
+        cursor.execute('''
+            INSERT INTO Users (email, name, created_date, modified_date)
+            VALUES (?, ?, ?, ?)
+        ''', (email, name, now, now))
+        user_id = cursor.lastrowid
+        cursor.execute('''
+            UPDATE Articles
+            SET createdById = ?, updatedById = ?
+        ''', (user_id, user_id))
+        self.conn.commit()
+        return user_id
     
     def insert_tag(self, tag_name, slug):
         cursor = self.conn.cursor()
@@ -627,6 +643,17 @@ def retrieve_from_wordpress():
     print("Database structure created with tables: Authors, Contents, Articles, Tags, ArticleTags, Users")
 
 
+def update_users_in_sqlite(sqlite_db_path):
+    db_manager = DatabaseManager(sqlite_db_path)
+    db_manager.connect()
+    user_id = db_manager.reset_users_to_migration_user(
+        "migration@industryinsider.bd",
+        "migration_user"
+    )
+    db_manager.close()
+    print(f"Users reset complete. New user id: {user_id}")
+
+
 def copy_sqlite_to_postgres(sqlite_db_path, pg_conn_params):
     """
     Copy all data from the SQLite database to a PostgreSQL database.
@@ -840,6 +867,7 @@ def main():
     parser.add_argument('--copy', action='store_true', help="Copy data from SQLite to PostgreSQL")
     parser.add_argument('--report-notnull', action='store_true', help="Report NOT NULL columns in PostgreSQL that are nullable or missing in SQLite")
     parser.add_argument('--diff', action='store_true', help="Compare column data types between SQLite and PostgreSQL")
+    parser.add_argument('--update-users', action='store_true', help="Reset Users table and update Articles created/updated by fields")
 
     args = parser.parse_args()
 
@@ -879,6 +907,9 @@ def main():
             "port": "5433"
         }
         compare_column_types(sqlite_db_path, pg_conn_params)
+    elif args.update_users:
+        sqlite_db_path = OUT_SQLITE or "dump.sqlite"
+        update_users_in_sqlite(sqlite_db_path)
 
 if __name__ == "__main__":
     main()
