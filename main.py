@@ -1,8 +1,75 @@
+def report_pg_notnull_columns(sqlite_db_path, pg_conn_params):
+    """
+    Compare each table in SQLite and PostgreSQL, and report columns in PostgreSQL that are NOT NULL but nullable or missing in SQLite.
+    """
+    import collections
+    sqlite_conn = sqlite3.connect(sqlite_db_path)
+    sqlite_cur = sqlite_conn.cursor()
+
+    pg_conn = psycopg2.connect(**pg_conn_params)
+    pg_cur = pg_conn.cursor()
+
+    tables = ["Authors", "Contents", "Users", "Articles", "Tags", "ArticleTags"]
+    print("\n--- PostgreSQL NOT NULL columns report ---")
+    for table in tables:
+        print(f"\nTable: {table}")
+        # Get SQLite columns
+        sqlite_cur.execute(f'PRAGMA table_info({table})')
+        sqlite_cols = {row[1]: row for row in sqlite_cur.fetchall()}  # row[1]=name, row[3]=notnull
+        # Get PostgreSQL columns
+        pg_cur.execute(f'''
+            SELECT column_name, is_nullable
+            FROM information_schema.columns
+            WHERE table_name = '{table.lower()}'
+            ORDER BY ordinal_position
+        ''')
+        pg_cols = collections.OrderedDict((row[0], row[1]) for row in pg_cur.fetchall())
+        # Report NOT NULL columns in PostgreSQL
+        found = False
+        for col, nullable in pg_cols.items():
+            if nullable == 'NO':
+                sqlite_notnull = sqlite_cols.get(col, (None, None, None, 0))[3]  # 1 if notnull in sqlite
+                if not sqlite_notnull:
+                    print(f"  - {col} is NOT NULL in PostgreSQL but nullable in SQLite or missing in SQLite")
+                    found = True
+        if not found:
+            print("  All NOT NULL columns in PostgreSQL are also NOT NULL in SQLite.")
+    sqlite_cur.close()
+    sqlite_conn.close()
+    pg_cur.close()
+    pg_conn.close()
+    print("\n--- End of report ---\n")
+def clear_postgres_tables(pg_cur, pg_conn):
+    """
+    Delete all records from the relevant tables in the correct order to avoid FK issues.
+    """
+    tables = [
+        "ArticleTags",
+        "Articles",
+        "Tags",
+        "Authors",
+        "Contents",
+        "Users"
+    ]
+    for table in tables:
+        try:
+            pg_cur.execute(f'DELETE FROM "{table}";')
+            pg_conn.commit()
+            print(f"Cleared table {table}")
+        except Exception as e:
+            print(f"Error clearing table {table}: {e}")
+            pg_conn.rollback()
+
+import psycopg2
+from psycopg2.extras import execute_values
+
+from slugify import slugify
 import requests
 import pandas as pd
 from bs4 import BeautifulSoup
 import sqlite3
 from datetime import datetime
+import os
 
 # ----------------------------
 # CONFIG — change these
@@ -18,6 +85,10 @@ OUT_SQLITE = "dump.sqlite"        # e.g. "wordpress_posts.sqlite" or None to ski
 
 API = f"{BASE_URL}/wp-json/wp/v2/posts"
 
+BASE_IMAGE_DIR = os.getenv('BASE_IMAGE_DIR', '')
+ARTICLE_IMAGE_DIR = os.path.join(BASE_IMAGE_DIR, 'articles')
+CONTENT_IMAGE_DIR = os.path.join(BASE_IMAGE_DIR, 'articleContents')
+
 session = requests.Session()
 if USERNAME and APP_PASSWORD:
     session.auth = (USERNAME, APP_PASSWORD)
@@ -26,6 +97,45 @@ def html_to_text(html):
     if not html:
         return ""
     return BeautifulSoup(html, "html.parser").get_text(separator=" ", strip=True)
+
+SELECTIVE_ENTITY_REPLACEMENTS = {
+    "&#8212;": "—",
+    "&#8212": "—",
+    "&8212;": "—",
+    "&8212": "—",
+    "&#8216;": "‘",
+    "&#8216": "‘",
+    "&8216;": "‘",
+    "&8216": "‘",
+    "&#8217;": "’",
+    "&#8217": "’",
+    "&8217;": "’",
+    "&8217": "’",
+    "&#038;": "&",
+    "&#038": "&",
+    "&038;": "&",
+    "&038": "&",
+    "&#8211;": "–",
+    "&#8211": "–",
+    "&8211;": "–",
+    "&8211": "–",
+    "&#8220": "“",
+    "&#8220;": "“",
+    "&8220": "“",
+    "&8220;": "“",
+    "&#8221": "”",
+    "&#8221;": "”",
+    "&8221": "”",
+    "&8221;": "”",
+}
+
+def decode_selected_entities(text):
+    if not text:
+        return ""
+    decoded = text
+    for encoded, decoded_char in SELECTIVE_ENTITY_REPLACEMENTS.items():
+        decoded = decoded.replace(encoded, decoded_char)
+    return decoded
 
 def term_names_from_embedded(p, taxonomy):
     """
@@ -70,39 +180,42 @@ class DatabaseManager:
         
     def create_tables(self):
         cursor = self.conn.cursor()
-        
-        # Create AUTHOR table
+        # Create Authors table
         cursor.execute('''
-            CREATE TABLE IF NOT EXISTS AUTHOR (
+            CREATE TABLE IF NOT EXISTS Authors (
                 id INTEGER PRIMARY KEY,
                 name TEXT,
                 email TEXT,
                 image TEXT,
                 bio TEXT,
-                slug TEXT UNIQUE
+                slug TEXT UNIQUE,
+                created_date TEXT,
+                modified_date TEXT
             )
         ''')
-        
-        # Create CONTENT table
+
+        # Create Contents table
         cursor.execute('''
-            CREATE TABLE IF NOT EXISTS CONTENT (
+            CREATE TABLE IF NOT EXISTS Contents (
                 id INTEGER PRIMARY KEY,
                 content TEXT
             )
         ''')
-        
-        # Create USER table (simplified for WordPress context)
+
+        # Create Users table (simplified for WordPress context)
         cursor.execute('''
-            CREATE TABLE IF NOT EXISTS USER (
+            CREATE TABLE IF NOT EXISTS Users (
                 id INTEGER PRIMARY KEY,
                 email TEXT,
-                name TEXT
+                name TEXT,
+                created_date TEXT,
+                modified_date TEXT
             )
         ''')
-        
-        # Create ARTICLE table
+
+        # Create Articles table
         cursor.execute('''
-            CREATE TABLE IF NOT EXISTS ARTICLE (
+            CREATE TABLE IF NOT EXISTS Articles (
                 id INTEGER PRIMARY KEY,
                 title TEXT,
                 subTitle TEXT,
@@ -120,69 +233,87 @@ class DatabaseManager:
                 created_date TEXT,
                 modified_date TEXT,
                 wp_link TEXT,
-                FOREIGN KEY (authorId) REFERENCES AUTHOR(id),
-                FOREIGN KEY (contentId) REFERENCES CONTENT(id),
-                FOREIGN KEY (createdById) REFERENCES USER(id),
-                FOREIGN KEY (updatedById) REFERENCES USER(id)
+                FOREIGN KEY (authorId) REFERENCES Authors(id),
+                FOREIGN KEY (contentId) REFERENCES Contents(id),
+                FOREIGN KEY (createdById) REFERENCES Users(id),
+                FOREIGN KEY (updatedById) REFERENCES Users(id)
             )
         ''')
-        
-        # Create TAG table
+
+        # Create Tags table
         cursor.execute('''
-            CREATE TABLE IF NOT EXISTS TAG (
-                id INTEGER PRIMARY KEY,
-                tag TEXT UNIQUE
+            CREATE TABLE IF NOT EXISTS Tags (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tag TEXT UNIQUE NOT NULL,
+                slug TEXT UNIQUE NOT NULL
             )
         ''')
-        
-        # Create ARTICLE_TAG junction table
+
+        # Create ArticleTags junction table
         cursor.execute('''
-            CREATE TABLE IF NOT EXISTS ARTICLE_TAG (
+            CREATE TABLE IF NOT EXISTS ArticleTags (
                 articleId INTEGER,
                 tagId INTEGER,
                 PRIMARY KEY (articleId, tagId),
-                FOREIGN KEY (articleId) REFERENCES ARTICLE(id),
-                FOREIGN KEY (tagId) REFERENCES TAG(id)
+                FOREIGN KEY (articleId) REFERENCES Articles(id),
+                FOREIGN KEY (tagId) REFERENCES Tags(id)
             )
         ''')
-        
         self.conn.commit()
     
     def insert_author(self, author_data):
         cursor = self.conn.cursor()
         cursor.execute('''
-            INSERT OR IGNORE INTO AUTHOR (id, name, email, image, bio, slug)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT OR IGNORE INTO Authors (id, name, email, image, bio, slug, created_date, modified_date)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             author_data["id"],
             author_data["name"],
             author_data["author_email"],
             author_data["avatar_url"],
             author_data["description"],
-            author_data["slug"]
+            author_data["slug"],
+            datetime.now().isoformat(),
+            datetime.now().isoformat()
         ))
         self.conn.commit()
         return author_data["id"]
     
     def insert_content(self, content_text):
         cursor = self.conn.cursor()
-        cursor.execute('INSERT INTO CONTENT (content) VALUES (?)', (content_text,))
+        cursor.execute('INSERT INTO Contents (content) VALUES (?)', (content_text,))
         self.conn.commit()
         return cursor.lastrowid
     
     def insert_user(self, user_id, name):
         cursor = self.conn.cursor()
         cursor.execute('''
-            INSERT OR IGNORE INTO USER (id, name, email)
-            VALUES (?, ?, ?)
-        ''', (user_id, name, ""))
+            INSERT OR IGNORE INTO Users (id, name, email, created_date, modified_date)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (user_id, name, "", datetime.now().isoformat(), datetime.now().isoformat()))
+        self.conn.commit()
+        return user_id
+
+    def reset_users_to_migration_user(self, email, name):
+        cursor = self.conn.cursor()
+        cursor.execute('DELETE FROM Users')
+        now = datetime.now().isoformat()
+        cursor.execute('''
+            INSERT INTO Users (email, name, created_date, modified_date)
+            VALUES (?, ?, ?, ?)
+        ''', (email, name, now, now))
+        user_id = cursor.lastrowid
+        cursor.execute('''
+            UPDATE Articles
+            SET createdById = ?, updatedById = ?
+        ''', (user_id, user_id))
         self.conn.commit()
         return user_id
     
-    def insert_tag(self, tag_name):
+    def insert_tag(self, tag_name, slug):
         cursor = self.conn.cursor()
-        cursor.execute('INSERT OR IGNORE INTO TAG (tag) VALUES (?)', (tag_name,))
-        cursor.execute('SELECT id FROM TAG WHERE tag = ?', (tag_name,))
+        cursor.execute('INSERT OR IGNORE INTO Tags (tag, slug) VALUES (?, ?)', (tag_name, slug))
+        cursor.execute('SELECT id FROM Tags WHERE tag = ?', (tag_name,))
         result = cursor.fetchone()
         self.conn.commit()
         return result[0] if result else None
@@ -190,11 +321,11 @@ class DatabaseManager:
     def insert_article(self, article_data):
         cursor = self.conn.cursor()
         cursor.execute('''
-            INSERT INTO ARTICLE (
+            INSERT INTO Articles (
                 id, title, subTitle, shoulder, description, authorId, contentId,
                 image, imageFolder, readCount, slug, isPublished, createdById,
-                updatedById, created_date, modified_date, wp_link
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                updatedById, created_date, modified_date
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', article_data)
         self.conn.commit()
         return article_data[0]  # return article id
@@ -202,7 +333,7 @@ class DatabaseManager:
     def insert_article_tag(self, article_id, tag_id):
         cursor = self.conn.cursor()
         cursor.execute('''
-            INSERT OR IGNORE INTO ARTICLE_TAG (articleId, tagId)
+            INSERT OR IGNORE INTO ArticleTags (articleId, tagId)
             VALUES (?, ?)
         ''', (article_id, tag_id))
         self.conn.commit()
@@ -220,19 +351,49 @@ def process_post(post, db_manager):
     
     # Insert content
     # content_text = html_to_text(post.get("content", {}).get("rendered", ""))
-    content_text = post.get("content", {}).get("rendered", "")
-    content_id = db_manager.insert_content(content_text)
-    
+    content_html = post.get("content", {}).get("rendered", "")
+    # Use article slug or id for unique folder name
+    unique_folder_name = post.get("slug") or str(post.get("id"))
+    processed_content_html = update_image_tags(content_html, unique_folder_name)
+    processed_content_html = decode_selected_entities(processed_content_html)
+    content_id = db_manager.insert_content(processed_content_html)
+    print(f"Inserted content for post ID {post.get('id')} with content ID {content_id}")
     # Insert user (using author info for simplicity, as WP doesn't expose user details easily)
     created_by_id = post.get("author")
     if created_by_id and author_info:
         db_manager.insert_user(created_by_id, author_info["name"])
     
     # Prepare article data
-    title = post.get("title", {}).get("rendered", "")
-    excerpt = html_to_text(post.get("excerpt", {}).get("rendered", ""))
+    title = decode_selected_entities(post.get("title", {}).get("rendered", ""))
+    excerpt = decode_selected_entities(html_to_text(post.get("excerpt", {}).get("rendered", "")))
     featured_image = featured_media_url(post)
-    
+    if featured_image:
+        featured_image_base = os.path.basename(featured_image)
+        featured_image_path = os.path.join(ARTICLE_IMAGE_DIR, featured_image_base)
+        
+        # Download and save the featured image
+        try:
+            # Create directory if it doesn't exist
+            os.makedirs(os.path.dirname(featured_image_path), exist_ok=True)
+            
+            # Download the featured image
+            print(f"Downloading featured image: {featured_image}")
+            response = requests.get(featured_image, timeout=30)
+            response.raise_for_status()
+            
+            # Save the featured image
+            with open(featured_image_path, 'wb') as f:
+                f.write(response.content)
+            print(f"Saved featured image to: {featured_image_path}")
+            
+            # Use the local path for the database
+            featured_image = featured_image_path
+            
+        except Exception as e:
+            print(f"Error downloading featured image {featured_image}: {e}")
+            # Keep original URL if download fails
+            pass
+
     article_data = (
         post.get("id"),                    # id
         title,                             # title
@@ -250,7 +411,6 @@ def process_post(post, db_manager):
         created_by_id,                     # updatedById (same as created)
         post.get("date"),                  # created_date
         post.get("modified"),              # modified_date
-        post.get("link")                   # wp_link
     )
     
     # Insert article
@@ -262,8 +422,10 @@ def process_post(post, db_manager):
     
     all_tags = cat_names + tag_names
     for tag_name in all_tags:
-        if tag_name.strip():
-            tag_id = db_manager.insert_tag(tag_name.strip())
+        tag_name_clean = tag_name.strip()
+        if tag_name_clean:
+            slug = slugify(tag_name_clean)
+            tag_id = db_manager.insert_tag(tag_name_clean, slug)
             if tag_id:
                 db_manager.insert_article_tag(article_id, tag_id)
     
@@ -305,7 +467,149 @@ def fetch_all_posts():
 
     return all_posts
 
-def main():
+def update_image_tags(content_html, unique_folder_name):
+    import requests
+    import os
+    from urllib.parse import urlparse
+    
+    soup = BeautifulSoup(content_html, 'html.parser')
+    image_tags = soup.find_all('img')
+
+    for img_tag in image_tags:
+        src = img_tag.get('src')
+        if src:
+            # Create the new path
+            new_src = os.path.join(
+                CONTENT_IMAGE_DIR,
+                unique_folder_name,
+                os.path.basename(src)
+            )
+            
+            # Download and save the image
+            try:
+                # Create directory if it doesn't exist
+                os.makedirs(os.path.dirname(new_src), exist_ok=True)
+                
+                # Download the image
+                print(f"Downloading image: {src}")
+                response = requests.get(src, timeout=30)
+                response.raise_for_status()
+                
+                # Save the image
+                with open(new_src, 'wb') as f:
+                    f.write(response.content)
+                print(f"Saved image to: {new_src}")
+                
+            except Exception as e:
+                print(f"Error downloading image {src}: {e}")
+                # Keep original src if download fails
+                continue
+            
+            # Update src attribute with new path
+            img_tag['src'] = new_src
+            # Set loading and decoding attributes
+            img_tag['loading'] = 'lazy'
+            img_tag['decoding'] = 'async'
+
+        # Update srcset attribute if it exists
+        srcset = img_tag.get('srcset')
+        if srcset:
+            # Split srcset by comma to get individual entries
+            srcset_entries = [entry.strip() for entry in srcset.split(',')]
+            updated_entries = []
+            
+            for entry in srcset_entries:
+                # Each entry is in format: "url width_descriptor" (e.g., "image.png 1553w")
+                parts = entry.strip().split()
+                if len(parts) >= 2:
+                    old_url = parts[0]
+                    width_descriptor = parts[-1]  # e.g., "1553w"
+                    
+                    # Create new path for this srcset image
+                    new_url = os.path.join(
+                        CONTENT_IMAGE_DIR,
+                        unique_folder_name,
+                        os.path.basename(old_url)
+                    )
+                    
+                    # Download and save the srcset image
+                    try:
+                        # Create directory if it doesn't exist
+                        os.makedirs(os.path.dirname(new_url), exist_ok=True)
+                        
+                        # Download the image if it doesn't already exist
+                        if not os.path.exists(new_url):
+                            print(f"Downloading srcset image: {old_url}")
+                            response = requests.get(old_url, timeout=30)
+                            response.raise_for_status()
+                            
+                            # Save the image
+                            with open(new_url, 'wb') as f:
+                                f.write(response.content)
+                            print(f"Saved srcset image to: {new_url}")
+                        
+                        # Rebuild the entry: "new_url width_descriptor"
+                        updated_entry = f"{new_url} {width_descriptor}"
+                        updated_entries.append(updated_entry)
+                        
+                    except Exception as e:
+                        print(f"Error downloading srcset image {old_url}: {e}")
+                        # Keep original URL if download fails
+                        updated_entry = f"{old_url} {width_descriptor}"
+                        updated_entries.append(updated_entry)
+                        
+                elif len(parts) == 1:
+                    # Just a URL without width descriptor
+                    old_url = parts[0]
+                    new_url = os.path.join(
+                        CONTENT_IMAGE_DIR,
+                        unique_folder_name,
+                        os.path.basename(old_url)
+                    )
+                    
+                    # Download and save the image
+                    try:
+                        os.makedirs(os.path.dirname(new_url), exist_ok=True)
+                        
+                        if not os.path.exists(new_url):
+                            print(f"Downloading image: {old_url}")
+                            response = requests.get(old_url, timeout=30)
+                            response.raise_for_status()
+                            
+                            with open(new_url, 'wb') as f:
+                                f.write(response.content)
+                            print(f"Saved image to: {new_url}")
+                        
+                        updated_entries.append(new_url)
+                        
+                    except Exception as e:
+                        print(f"Error downloading image {old_url}: {e}")
+                        updated_entries.append(old_url)
+            
+            # Rejoin the srcset entries with commas and spaces
+            img_tag['srcset'] = ', '.join(updated_entries)
+
+        # --- Fix image alignment classes ---
+        current_class = img_tag.get('class')
+        if current_class:
+            if isinstance(current_class, str):
+                current_class = [current_class]
+
+            updated_classes = []
+            for cls in current_class:
+                if cls == "alignright":
+                    updated_classes.append("image-right")
+                elif cls == "alignleft":
+                    updated_classes.append("image-left")
+                elif cls == "aligncenter":
+                    updated_classes.append("image-center")
+                else:
+                    updated_classes.append(cls)
+            img_tag['class'] = updated_classes
+
+    return str(soup)
+
+def retrieve_from_wordpress():
     print("Fetching posts from WordPress API...")
     posts = fetch_all_posts()
     print(f"Found {len(posts)} posts")
@@ -336,7 +640,276 @@ def main():
             df.to_csv(OUT_CSV, index=False, encoding="utf-8")
             print(f"Created summary CSV: {OUT_CSV}")
     
-    print("Database structure created with tables: AUTHOR, CONTENT, ARTICLE, TAG, ARTICLE_TAG, USER")
+    print("Database structure created with tables: Authors, Contents, Articles, Tags, ArticleTags, Users")
+
+
+def update_users_in_sqlite(sqlite_db_path):
+    db_manager = DatabaseManager(sqlite_db_path)
+    db_manager.connect()
+    user_id = db_manager.reset_users_to_migration_user(
+        "migration@industryinsider.bd",
+        "migration_user"
+    )
+    db_manager.close()
+    print(f"Users reset complete. New user id: {user_id}")
+
+
+def copy_sqlite_to_postgres(sqlite_db_path, pg_conn_params):
+    """
+    Copy all data from the SQLite database to a PostgreSQL database.
+    pg_conn_params: dict with keys dbname, user, password, host, port
+    """
+    sqlite_conn = sqlite3.connect(sqlite_db_path)
+    sqlite_cur = sqlite_conn.cursor()
+
+    # Connect to PostgreSQL and sanity check
+    pg_conn = psycopg2.connect(**pg_conn_params)
+    pg_cur = pg_conn.cursor()
+    try:
+        pg_cur.execute("SELECT version();")
+        version = pg_cur.fetchone()[0]
+        print(f"Connected to PostgreSQL: {version}")
+
+        # List all tables in the public schema
+        print("\nTables in public schema:")
+        pg_cur.execute("""
+            SELECT table_name FROM information_schema.tables
+            WHERE table_schema = 'public'
+            ORDER BY table_name;
+        """)
+        tables = pg_cur.fetchall()
+        for t in tables:
+            table_name = t[0]
+            print(f"  {table_name}")
+            # Print columns for each table
+            try:
+                pg_cur.execute(f"SELECT column_name, data_type FROM information_schema.columns WHERE table_name = '{table_name}';")
+                columns = pg_cur.fetchall()
+                for col, dtype in columns:
+                    print(f"    - {col}: {dtype}")
+            except Exception as e:
+                print(f"    Could not fetch columns for {table_name}: {e}")
+
+        # Print table schemas for expected tables
+        print("\nPostgreSQL table schemas (expected tables):")
+        for table in ["Authors", "Contents", "Articles", "Tags", "ArticleTags"]:
+            try:
+                pg_cur.execute(f"SELECT column_name, data_type FROM information_schema.columns WHERE table_name = '{table.lower()}';")
+                columns = pg_cur.fetchall()
+                print(f"Table {table}:")
+                for col, dtype in columns:
+                    print(f"  {col}: {dtype}")
+            except Exception as e:
+                print(f"  Could not fetch schema for {table}: {e}")
+
+        # Clear all records from the tables before insertion
+        print("\nClearing all records from relevant tables...")
+        clear_postgres_tables(pg_cur, pg_conn)
+
+        # --- INSERT DATA ---
+        print("\nCopying data from SQLite to PostgreSQL...")
+        table_order = [
+            "Authors",
+            "Contents",
+            "Users",
+            "Articles",
+            "Tags",
+            "ArticleTags"
+        ]
+        for table in table_order:
+            print(f"Copying table {table}...")
+            try:
+                copy_table_with_column_mapping(sqlite_cur, pg_cur, pg_conn, table, SQLITE_TO_PG_COL_MAP[table])
+                print(f"  Done copying {table}")
+            except Exception as e:
+                print(f"Error copying table {table}: {e}")
+
+    except Exception as e:
+        print(f"PostgreSQL sanity check failed: {e}")
+    finally:
+        sqlite_cur.close()
+        sqlite_conn.close()
+        pg_cur.close()
+        pg_conn.close()
+SQLITE_TO_PG_COL_MAP = {
+    "Authors": {
+        "id": "id",
+        "name": "name",
+        "email": "email",
+        "image": "image",
+        "bio": "bio",
+        "slug": "slug",
+        "created_date": "createdAt",
+        "modified_date": "updatedAt"
+    },
+    "Contents": {
+        "id": "id",
+        "content": "content"
+    },
+    "Users": {
+        "id": "id",
+        "email": "email",
+        "name": "name",
+        "created_date": "createdAt",
+        "modified_date": "updatedAt",
+    },
+    "Articles": {
+        "id": "id",
+        "title": "title",
+        "subTitle": "subTitle",         # Case-sensitive!
+        "shoulder": "shoulder",
+        "description": "description",
+        "authorId": "authorId",
+        "contentId": "contentId",
+        "image": "image",
+        "imageFolder": "imageFolder",
+        "readCount": "readCount",
+        "slug": "slug",
+        "isPublished": "isPublished",
+        "createdById": "createdById",
+        "updatedById": "updatedById",
+        "created_date": "createdAt",
+        "modified_date": "updatedAt",
+    },
+    "Tags": {
+        "id": "id",
+        "tag": "tag",
+        "slug": "slug"
+    },
+    "ArticleTags": {
+        "articleId": "ArticleId",
+        "tagId": "TagId"
+    }
+}
+
+def copy_table_with_column_mapping(sqlite_cur, pg_cur, pg_conn, table, col_map):
+    sqlite_cur.execute(f"SELECT * FROM {table}")
+    rows = sqlite_cur.fetchall()
+    sqlite_columns = [desc[0] for desc in sqlite_cur.description]
+
+    # Map columns for PostgreSQL
+    pg_columns = [col_map[col] for col in sqlite_columns if col in col_map]
+    pg_columns_sql = ', '.join(f'"{col}"' for col in pg_columns)
+    placeholders = ', '.join(['%s'] * len(pg_columns))
+
+    for row in rows:
+        mapped_row = [row[sqlite_columns.index(sql_col)] for sql_col in sqlite_columns if sql_col in col_map]
+        # Convert isPublished to boolean if present in Articles
+        if table == "Articles" and "isPublished" in pg_columns:
+            idx = pg_columns.index("isPublished")
+            mapped_row[idx] = bool(mapped_row[idx]) if mapped_row[idx] is not None else False
+        try:
+            pg_cur.execute(
+                f'INSERT INTO "{table}" ({pg_columns_sql}) VALUES ({placeholders})',
+                mapped_row
+            )
+        except Exception as e:
+            print(f"Error inserting row into {table}: {e}")
+            pg_conn.rollback()
+        else:
+            pg_conn.commit()
+
+def compare_column_types(sqlite_db_path, pg_conn_params):
+    """
+    Compare column data types between SQLite and PostgreSQL for each table.
+    Reports columns with mismatched or missing types.
+    """
+    import collections
+    sqlite_conn = sqlite3.connect(sqlite_db_path)
+    sqlite_cur = sqlite_conn.cursor()
+
+    pg_conn = psycopg2.connect(**pg_conn_params)
+    pg_cur = pg_conn.cursor()
+
+    tables = ["Authors", "Contents", "Users", "Articles", "Tags", "ArticleTags"]
+    print("\n--- Column Type Comparison Report ---")
+    for table in tables:
+        print(f"\nTable: {table}")
+
+        # Get SQLite columns and types
+        sqlite_cur.execute(f'PRAGMA table_info({table})')
+        sqlite_cols = {row[1]: row[2].upper() for row in sqlite_cur.fetchall()}  # row[1]=name, row[2]=type
+
+        # Get PostgreSQL columns and types
+        pg_cur.execute(f'''
+            SELECT column_name, data_type
+            FROM information_schema.columns
+            WHERE table_name = '{table.lower()}'
+            ORDER BY ordinal_position
+        ''')
+        pg_cols = collections.OrderedDict((row[0], row[1].upper()) for row in pg_cur.fetchall())
+
+        # Compare types
+        for col, pg_type in pg_cols.items():
+            sqlite_type = sqlite_cols.get(col)
+            if sqlite_type is None:
+                print(f"  - {col}: present in PostgreSQL ({pg_type}), missing in SQLite")
+            elif sqlite_type != pg_type:
+                print(f"  - {col}: type mismatch (SQLite: {sqlite_type}, PostgreSQL: {pg_type})")
+        for col, sqlite_type in sqlite_cols.items():
+            if col not in pg_cols:
+                print(f"  - {col}: present in SQLite ({sqlite_type}), missing in PostgreSQL")
+        if not pg_cols:
+            print("  (No columns found in PostgreSQL for this table)")
+    sqlite_cur.close()
+    sqlite_conn.close()
+    pg_cur.close()
+    pg_conn.close()
+    print("\n--- End of type comparison report ---\n")
+
+    
+def main():
+    # take two option one to retrieve from wordpress and create sqlite db
+    # second to copy from sqlite to postgres
+    import argparse 
+    parser = argparse.ArgumentParser(description="WordPress to SQLite/PostgreSQL migration tool")
+    parser.add_argument('--retrieve', action='store_true', help="Retrieve posts from WordPress and create SQLite database")
+    parser.add_argument('--copy', action='store_true', help="Copy data from SQLite to PostgreSQL")
+    parser.add_argument('--report-notnull', action='store_true', help="Report NOT NULL columns in PostgreSQL that are nullable or missing in SQLite")
+    parser.add_argument('--diff', action='store_true', help="Compare column data types between SQLite and PostgreSQL")
+    parser.add_argument('--update-users', action='store_true', help="Reset Users table and update Articles created/updated by fields")
+
+    args = parser.parse_args()
+
+    if args.retrieve:
+        retrieve_from_wordpress()
+    elif args.copy:
+        # Define your SQLite and PostgreSQL connection parameters
+        sqlite_db_path = "dump.sqlite"
+        pg_conn_params = {
+            "dbname": "appdb",
+            "user": "appuser",
+            "password": "supersecret",
+            "host": "127.0.0.1",
+            "port": "5433"
+        }
+        # Call the function to copy data
+        copy_sqlite_to_postgres(sqlite_db_path, pg_conn_params)
+    elif args.report_notnull:
+        # Define your SQLite and PostgreSQL connection parameters
+        sqlite_db_path = "dump.sqlite"
+        pg_conn_params = {
+            "dbname": "appdb",
+            "user": "appuser",
+            "password": "supersecret",
+            "host": "127.0.0.1",
+            "port": "5433"
+        }
+        report_pg_notnull_columns(sqlite_db_path, pg_conn_params)
+    elif args.diff:
+        # Define your SQLite and PostgreSQL connection parameters
+        sqlite_db_path = "dump.sqlite"
+        pg_conn_params = {
+            "dbname": "appdb",
+            "user": "appuser",
+            "password": "supersecret",
+            "host": "127.0.0.1",
+            "port": "5433"
+        }
+        compare_column_types(sqlite_db_path, pg_conn_params)
+    elif args.update_users:
+        sqlite_db_path = OUT_SQLITE or "dump.sqlite"
+        update_users_in_sqlite(sqlite_db_path)
 
 if __name__ == "__main__":
     main()
